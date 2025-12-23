@@ -4,7 +4,10 @@ import { ObjectId } from "mongodb";
 import { getAuthUser } from "@/lib/auth";
 
 /**
- * CREATE ORDER
+ * CREATE ORDER (CUSTOMER + ADMIN)
+ * - Checks stock
+ * - Reduces stock
+ * - Prevents overselling
  */
 export async function POST(req: NextRequest) {
   const user = getAuthUser(req);
@@ -14,7 +17,7 @@ export async function POST(req: NextRequest) {
 
   const { items } = await req.json();
 
-  if (!items || items.length === 0) {
+  if (!items || !Array.isArray(items) || items.length === 0) {
     return NextResponse.json(
       { error: "Order items required" },
       { status: 400 }
@@ -24,11 +27,12 @@ export async function POST(req: NextRequest) {
   const client = await clientPromise;
   const db = client.db();
 
+  const orderItems: any[] = [];
   let subtotal = 0;
 
-  // 🔒 validate stock & calculate price
-  const orderItems = [];
-
+  /**
+   * STEP 1: Validate all products & stock
+   */
   for (const item of items) {
     const product = await db.collection("products").findOne({
       _id: new ObjectId(item.productId),
@@ -36,21 +40,32 @@ export async function POST(req: NextRequest) {
     });
 
     if (!product) {
-      return NextResponse.json({ error: "Product not found" }, { status: 404 });
+      return NextResponse.json(
+        { error: "Product not found or inactive" },
+        { status: 404 }
+      );
     }
 
-    const variant = product.variants.find(
+    const variant = product.variants?.find(
       (v: any) => v.size === item.variant.size && v.color === item.variant.color
     );
 
-    if (!variant || variant.stock < item.quantity) {
+    if (!variant) {
+      return NextResponse.json({ error: "Variant not found" }, { status: 400 });
+    }
+
+    if (variant.stock < item.quantity) {
       return NextResponse.json(
-        { error: "Insufficient stock" },
+        {
+          error: "Product out of stock",
+          productId: product._id,
+          availableStock: variant.stock,
+        },
         { status: 400 }
       );
     }
 
-    subtotal += item.quantity * product.price;
+    subtotal += product.price * item.quantity;
 
     orderItems.push({
       productId: product._id,
@@ -62,11 +77,61 @@ export async function POST(req: NextRequest) {
     });
   }
 
+  /**
+   * STEP 2: Reduce stock (SAFE)
+   */
+  for (const item of orderItems) {
+    const result = await db.collection("products").updateOne(
+      {
+        _id: item.productId,
+        "variants.size": item.variant.size,
+        "variants.color": item.variant.color,
+        "variants.stock": { $gte: item.quantity }, // 🔒 safety check
+      },
+      {
+        $inc: {
+          "variants.$.stock": -item.quantity,
+        },
+      }
+    );
+
+    // If update failed → rollback logic (simple fail)
+    if (result.modifiedCount === 0) {
+      return NextResponse.json(
+        { error: "Stock update failed, please retry" },
+        { status: 409 }
+      );
+    }
+  }
+
+  /**
+   * STEP 3: Update product status if all variants are out of stock
+   */
+  for (const item of orderItems) {
+    const product = await db.collection("products").findOne({
+      _id: item.productId,
+    });
+
+    const totalStock =
+      product?.variants?.reduce((sum: number, v: any) => sum + v.stock, 0) || 0;
+
+    if (totalStock === 0) {
+      await db
+        .collection("products")
+        .updateOne(
+          { _id: item.productId },
+          { $set: { status: "out_of_stock" } }
+        );
+    }
+  }
+
+  /**
+   * STEP 4: Create order
+   */
   const tax = Math.round(subtotal * 0.05);
   const total = subtotal + tax;
 
-  // 🧾 create order
-  const result = await db.collection("orders").insertOne({
+  const order = await db.collection("orders").insertOne({
     userId: new ObjectId(user.userId),
     items: orderItems,
     subtotal,
@@ -78,27 +143,15 @@ export async function POST(req: NextRequest) {
     updatedAt: new Date(),
   });
 
-  // 📉 reduce stock
-  for (const item of orderItems) {
-    await db.collection("products").updateOne(
-      {
-        _id: item.productId,
-        "variants.size": item.variant.size,
-        "variants.color": item.variant.color,
-      },
-      {
-        $inc: { "variants.$.stock": -item.quantity },
-      }
-    );
-  }
-
-  // 🗑️ clear cart
+  /**
+   * STEP 5: Clear cart
+   */
   await db.collection("carts").deleteOne({
     userId: new ObjectId(user.userId),
   });
 
   return NextResponse.json({
     success: true,
-    orderId: result.insertedId,
+    orderId: order.insertedId,
   });
 }
