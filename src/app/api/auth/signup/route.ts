@@ -25,14 +25,14 @@ export async function POST(req: Request) {
     name,
     email,
     password: hashedPassword,
-    role: "consumer", // ✅ VALID ROLE
+    role: "customer",
     createdAt: new Date(),
   });
 
   // ✅ JWT payload matches lib/jwt.ts exactly
   const token = signToken({
     userId: result.insertedId.toString(),
-    role: "consumer",
+    role: "customer",
   });
 
   return NextResponse.json({
