@@ -29,7 +29,6 @@ export async function POST(req: Request) {
     createdAt: new Date(),
   });
 
-  // ✅ JWT payload matches lib/jwt.ts exactly
   const token = signToken({
     userId: result.insertedId.toString(),
     role: "customer",
